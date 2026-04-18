@@ -13,8 +13,8 @@ import (
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
-	"google.golang.org/protobuf/proto"
 
+	"github.com/nextlevelbuilder/goclaw/internal/audio"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
@@ -28,37 +28,36 @@ const (
 
 func init() {
 	// Set device name shown in WhatsApp's "Linked Devices" screen (once at package init).
-	wastore.DeviceProps.Os = proto.String("GoClaw")
+	wastore.DeviceProps.Os = new("GoClaw")
 }
 
 // Channel connects directly to WhatsApp via go.mau.fi/whatsmeow.
 // Auth state is stored in PostgreSQL (standard) or SQLite (desktop).
 type Channel struct {
 	*channels.BaseChannel
-	client          *whatsmeow.Client
-	container       *sqlstore.Container
-	config          config.WhatsAppConfig
-	mu              sync.Mutex
-	ctx             context.Context
-	cancel          context.CancelFunc
-	parentCtx       context.Context // stored from Start() for Reauth() context chain
-	pairingService  store.PairingStore
-	pairingDebounce sync.Map // senderID → time.Time
-	approvedGroups  sync.Map // chatID → true (in-memory cache for paired groups)
-	groupHistory    *channels.PendingHistory // tracks group messages for context
+	client    *whatsmeow.Client
+	container *sqlstore.Container
+	config    config.WhatsAppConfig
+	mu        sync.Mutex
+	ctx       context.Context
+	cancel    context.CancelFunc
+	parentCtx        context.Context       // stored from Start() for Reauth() context chain
+	audioMgr         *audio.Manager        // unified STT via audio.Manager (nil = no STT)
+	builtinToolStore store.BuiltinToolStore // reads stt settings (whatsapp_enabled) per voice message; nil = opt-out
 
 	// QR state
 	lastQRMu        sync.RWMutex
-	lastQRB64       string     // base64-encoded PNG, empty when authenticated
-	waAuthenticated bool       // true once WhatsApp account is connected
-	myJID           types.JID  // linked account's phone JID for mention detection
-	myLID           types.JID  // linked account's LID — WhatsApp's newer identifier
+	lastQRB64       string    // base64-encoded PNG, empty when authenticated
+	waAuthenticated bool      // true once WhatsApp account is connected
+	myJID           types.JID // linked account's phone JID for mention detection
+	myLID           types.JID // linked account's LID — WhatsApp's newer identifier
 
 	// typingCancel tracks active typing-refresh loops per chatID.
 	typingCancel sync.Map // chatID string → context.CancelFunc
 
 	// reauthMu serializes Reauth() and StartQRFlow() to prevent race when user clicks reauth rapidly.
 	reauthMu sync.Mutex
+	// pairingService, pairingDebounce, approvedGroups, groupHistory are inherited from channels.BaseChannel.
 }
 
 // GetLastQRB64 returns the most recent QR PNG (base64).
@@ -84,9 +83,12 @@ func (c *Channel) cacheQR(pngB64 string) {
 
 // New creates a new WhatsApp channel backed by whatsmeow.
 // dialect must be "pgx" (PostgreSQL) or "sqlite3" (SQLite/desktop).
+// audioMgr is optional (nil = STT disabled).
+// builtinToolStore is optional (nil = STT permanently opt-out regardless of admin toggle).
 func New(cfg config.WhatsAppConfig, msgBus *bus.MessageBus,
 	pairingSvc store.PairingStore, db *sql.DB,
-	pendingStore store.PendingMessageStore, dialect string) (*Channel, error) {
+	pendingStore store.PendingMessageStore, dialect string, audioMgr *audio.Manager,
+	builtinToolStore store.BuiltinToolStore) (*Channel, error) {
 
 	base := channels.NewBaseChannel(channels.TypeWhatsApp, msgBus, cfg.AllowFrom)
 	base.ValidatePolicy(cfg.DMPolicy, cfg.GroupPolicy)
@@ -96,13 +98,16 @@ func New(cfg config.WhatsAppConfig, msgBus *bus.MessageBus,
 		return nil, fmt.Errorf("whatsapp sqlstore upgrade: %w", err)
 	}
 
-	return &Channel{
-		BaseChannel:    base,
-		config:         cfg,
-		pairingService: pairingSvc,
-		container:      container,
-		groupHistory:   channels.MakeHistory("whatsapp", pendingStore, base.TenantID()),
-	}, nil
+	ch := &Channel{
+		BaseChannel:      base,
+		config:           cfg,
+		container:        container,
+		audioMgr:         audioMgr,
+		builtinToolStore: builtinToolStore,
+	}
+	ch.SetPairingService(pairingSvc)
+	ch.SetGroupHistory(channels.MakeHistory("whatsapp", pendingStore, base.TenantID()))
+	return ch, nil
 }
 
 // Start initializes the whatsmeow client and connects to WhatsApp.
